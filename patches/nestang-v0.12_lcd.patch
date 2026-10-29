@@ -1,0 +1,590 @@
+diff -ruN a/src/nes2lcd.sv b/src/nes2lcd.sv
+--- a/src/nes2lcd.sv	1970-01-01 09:00:00.000000000 +0900
++++ b/src/nes2lcd.sv	2026-10-29 23:42:18.224300036 +0900
+@@ -0,0 +1,416 @@
++// nes2lcd.sv - NESTang の PPU 出力を ILI9341 (8080 8bit) に表示する
++//
++// 位置づけ : nes2hdmi.sv (NESTang v0.12) の置き換え / 並行出力用。骨組み版 (rev0)
++// 対象     : Tang Primer 25K + 2.4" ILI9341 UNO シールド (8bit, TE なし)
++//
++// 構成
++//   [PPU] color/cycle/scanline ──> フレームバッファ 256x240x6bit (BSRAM, 368,640 bit)
++//                                        │ 同一クロック clk で読み出し
++//                                        v
++//                                  パレット LUT (64色 -> RGB565)
++//                                        │
++//   初期化 ROM ─> シーケンサ ─> 8080 8bit 送信器 ─> LCD_D[7:0], RS, WR, CS, RST, RD
++//
++// タイミング (clk = 21.4912 MHz, 46.53 ns/clk, WR_LOW = WR_HIGH = 1 のとき)
++//   1 バイト = 2 clk = 93.1 ns   (ILI9341 tWC >= 66 ns, tWRL/tWRH >= 15 ns)
++//   1 フレーム = 256 x 240 x 2 バイト x 93.1 ns = 11.44 ms  (< 16.64 ms)
++//   読み出し 1 ライン = 256 x 4 clk = 47.6 us  <  PPU の書き込み 1 ライン = 63.5 us
++//   -> VBlank 開始 (scanline 240) で読み出しを始めれば、PPU が次フレームの
++//      ライン 0 を書き始める (約 22 ライン = 1.40 ms 後) より常に先行するので、
++//      フレームバッファ上ではティアリングしない。
++//      (LCD パネル自身のリフレッシュとのずれによるティアリングは TE が無いため残る)
++//
++// 注意
++//   - MADCTL (0x36) の値は向きと RGB/BGR の順番で変わる。まず 8'h28 (MV|BGR) で試し、
++//     上下左右が反転していれば 8'h68 / 8'hA8 / 8'hE8、赤青が逆なら bit3 (BGR) を反転。
++//   - RD は常に H。UNO シールドのレベル変換 (245) は読み出し方向が使えないことが多い。
++//   - HDMI と同時に使う場合、フレームバッファが 2 面 (約 737 Kbit) になる。
++//     BSRAM は 1008 Kbit なので、合成レポートで使用量を必ず確認すること。
++
++`timescale 1ns / 1ps
++
++module nes2lcd #(
++    parameter int CLK_HZ   = 21_491_200,  // NES の clk (primer25k/nestang.sdc)
++    parameter int WR_LOW   = 1,           // WR の L 期間 [clk]
++    parameter int WR_HIGH  = 1,           // WR の H 期間 [clk]
++    parameter int X_OFS    = 32,          // 320 幅の中央に 256 を置く: (320-256)/2
++    parameter logic [7:0] MADCTL = 8'h28, // 横向き (MV=1) + BGR
++    parameter int MS_DIV   = CLK_HZ / 1000 // 1 ms あたりの clk 数 (シミュレーションで小さくする)
++)(
++    input  logic       clk,        // NES clock
++    input  logic       resetn,
++
++    // PPU 出力 (nes2hdmi と同じ信号)
++    input  logic [5:0] color,
++    input  logic [8:0] cycle,
++    input  logic [8:0] scanline,
++
++    // LCD (8080 8bit)
++    output logic       lcd_rst_n,
++    output logic       lcd_cs_n,
++    output logic       lcd_rs,     // 0: コマンド, 1: データ
++    output logic       lcd_wr_n,
++    output logic       lcd_rd_n,
++    output logic [7:0] lcd_d,
++
++    // デバッグ用 (GAO や LED で観測)
++    output logic       init_done,
++    output logic       frame_start
++);
++
++// ---------------------------------------------------------------------------
++// 1. フレームバッファ (書き込み側は nes2hdmi.sv v0.12 と同じ条件)
++// ---------------------------------------------------------------------------
++logic [5:0]  fb [0:256*240-1];
++logic [15:0] fb_waddr;
++logic [5:0]  fb_wdata;
++logic        fb_we;
++logic [15:0] fb_raddr;
++logic [5:0]  fb_q;
++
++logic [8:0] r_scanline, r_cycle;
++always_ff @(posedge clk) begin
++    r_scanline <= scanline;
++    r_cycle    <= cycle;
++    fb_we      <= 1'b0;
++    if ((r_scanline != scanline || r_cycle != cycle) && scanline < 9'd240 && ~cycle[8]) begin
++        fb_waddr <= {scanline[7:0], cycle[7:0]};
++        fb_wdata <= color;
++        fb_we    <= 1'b1;
++    end
++end
++
++always_ff @(posedge clk) begin
++    if (fb_we) fb[fb_waddr] <= fb_wdata;
++end
++
++always_ff @(posedge clk) fb_q <= fb[fb_raddr];     // 読み出しレイテンシ 1 clk
++
++// ---------------------------------------------------------------------------
++// 2. パレット (NESTang v0.12 nes2hdmi.sv の NES_PALETTE を RGB565 に変換)
++//    emphasis は未対応 (nes2hdmi も未対応)
++// ---------------------------------------------------------------------------
++function automatic logic [15:0] pal565(input logic [5:0] idx);
++    case (idx)
++        6'd0 : pal565 = 16'h52AA;  // #545454
++        6'd1 : pal565 = 16'h00EE;  // #001E74
++        6'd2 : pal565 = 16'h0892;  // #081090
++        6'd3 : pal565 = 16'h3011;  // #300088
++        6'd4 : pal565 = 16'h400C;  // #440064
++        6'd5 : pal565 = 16'h5806;  // #5C0030
++        6'd6 : pal565 = 16'h5020;  // #540400
++        6'd7 : pal565 = 16'h38C0;  // #3C1800
++        6'd8 : pal565 = 16'h2140;  // #202A00
++        6'd9 : pal565 = 16'h09C0;  // #083A00
++        6'd10: pal565 = 16'h0200;  // #004000
++        6'd11: pal565 = 16'h01E0;  // #003C00
++        6'd12: pal565 = 16'h0187;  // #00323C
++        6'd13: pal565 = 16'h0000;  // #000000
++        6'd14: pal565 = 16'h0000;  // #000000
++        6'd15: pal565 = 16'h0000;  // #000000
++        6'd16: pal565 = 16'h9CB3;  // #989698
++        6'd17: pal565 = 16'h0A78;  // #084CC4
++        6'd18: pal565 = 16'h319D;  // #3032EC
++        6'd19: pal565 = 16'h58FC;  // #5C1EE4
++        6'd20: pal565 = 16'h88B6;  // #8814B0
++        6'd21: pal565 = 16'hA0AC;  // #A01464
++        6'd22: pal565 = 16'h9904;  // #982220
++        6'd23: pal565 = 16'h79E0;  // #783C00
++        6'd24: pal565 = 16'h52C0;  // #545A00
++        6'd25: pal565 = 16'h2B80;  // #287200
++        6'd26: pal565 = 16'h0BE0;  // #087C00
++        6'd27: pal565 = 16'h03A5;  // #007628
++        6'd28: pal565 = 16'h032F;  // #006678
++        6'd29: pal565 = 16'h0000;  // #000000
++        6'd30: pal565 = 16'h0000;  // #000000
++        6'd31: pal565 = 16'h0000;  // #000000
++        6'd32: pal565 = 16'hEF7D;  // #ECEEEC
++        6'd33: pal565 = 16'h4CDD;  // #4C9AEC
++        6'd34: pal565 = 16'h7BFD;  // #787CEC
++        6'd35: pal565 = 16'hB31D;  // #B062EC
++        6'd36: pal565 = 16'hE2BD;  // #E454EC
++        6'd37: pal565 = 16'hEAD6;  // #EC58B4
++        6'd38: pal565 = 16'hEB4C;  // #EC6A64
++        6'd39: pal565 = 16'hD444;  // #D48820
++        6'd40: pal565 = 16'hA540;  // #A0AA00
++        6'd41: pal565 = 16'h7620;  // #74C400
++        6'd42: pal565 = 16'h4E84;  // #4CD020
++        6'd43: pal565 = 16'h3E6D;  // #38CC6C
++        6'd44: pal565 = 16'h3DB9;  // #38B4CC
++        6'd45: pal565 = 16'h39E7;  // #3C3C3C
++        6'd46: pal565 = 16'h0000;  // #000000
++        6'd47: pal565 = 16'h0000;  // #000000
++        6'd48: pal565 = 16'hEF7D;  // #ECEEEC
++        6'd49: pal565 = 16'hAE7D;  // #A8CCEC
++        6'd50: pal565 = 16'hBDFD;  // #BCBCEC
++        6'd51: pal565 = 16'hD59D;  // #D4B2EC
++        6'd52: pal565 = 16'hED7D;  // #ECAEEC
++        6'd53: pal565 = 16'hED7A;  // #ECAED4
++        6'd54: pal565 = 16'hEDB6;  // #ECB4B0
++        6'd55: pal565 = 16'hE632;  // #E4C490
++        6'd56: pal565 = 16'hCE8F;  // #CCD278
++        6'd57: pal565 = 16'hB6EF;  // #B4DE78
++        6'd58: pal565 = 16'hAF12;  // #A8E290
++        6'd59: pal565 = 16'h9F16;  // #98E2B4
++        6'd60: pal565 = 16'hA6BC;  // #A0D6E4
++        6'd61: pal565 = 16'hA514;  // #A0A2A0
++        6'd62: pal565 = 16'h0000;  // #000000
++        6'd63: pal565 = 16'h0000;  // #000000
++        default: pal565 = 16'h0000;
++    endcase
++endfunction
++
++// ---------------------------------------------------------------------------
++// 3. 8080 8bit 送信器
++//    tx_start = 1 かつ tx_ready = 1 のクロックエッジで 1 バイトを受け付ける
++//    (tx_start/tx_rs_in/tx_d_in はシーケンサの組み合わせ出力。遅延なしで連続送信できる)。
++//    データと RS は WR 立ち下がりと同時に変え、WR 立ち上がりで LCD が取り込む。
++//    連続送信時: セットアップ = WR_LOW clk, ホールド = WR_HIGH clk
++// ---------------------------------------------------------------------------
++typedef enum logic [1:0] {TX_IDLE, TX_LOW, TX_HIGH} tx_state_t;
++tx_state_t  tx_state;
++logic [7:0] tx_cnt;
++logic       tx_start;
++logic       tx_rs_in;
++logic [7:0] tx_d_in;
++logic       tx_ready;
++
++assign tx_ready = (tx_state == TX_IDLE) || (tx_state == TX_HIGH && tx_cnt == 0);
++
++always_ff @(posedge clk) begin
++    if (!resetn) begin
++        tx_state <= TX_IDLE;
++        tx_cnt   <= '0;
++        lcd_wr_n <= 1'b1;
++        lcd_rs   <= 1'b1;
++        lcd_d    <= 8'h00;
++    end else begin
++        if (tx_ready && tx_start) begin
++            lcd_d    <= tx_d_in;
++            lcd_rs   <= tx_rs_in;
++            lcd_wr_n <= 1'b0;
++            tx_cnt   <= 8'(WR_LOW - 1);
++            tx_state <= TX_LOW;
++        end else begin
++            case (tx_state)
++            TX_LOW:
++                if (tx_cnt == 0) begin
++                    lcd_wr_n <= 1'b1;
++                    tx_cnt   <= 8'(WR_HIGH - 1);
++                    tx_state <= TX_HIGH;
++                end else tx_cnt <= tx_cnt - 1'b1;
++            TX_HIGH:
++                if (tx_cnt == 0) tx_state <= TX_IDLE;
++                else             tx_cnt   <= tx_cnt - 1'b1;
++            default: ;
++            endcase
++        end
++    end
++end
++
++// ---------------------------------------------------------------------------
++// 4. 初期化 ROM
++//    {op, val}  op: 0=コマンド, 1=データ, 2=待ち(val ms), 3=特殊(val: 0=全面クリア, FF=終了)
++// ---------------------------------------------------------------------------
++localparam logic [1:0] OP_CMD = 2'd0, OP_DAT = 2'd1, OP_DLY = 2'd2, OP_SPC = 2'd3;
++localparam logic [7:0] SPC_CLEAR = 8'h00, SPC_END = 8'hFF;
++
++localparam logic [8:0] X0 = 9'(X_OFS);          // 32
++localparam logic [8:0] X1 = 9'(X_OFS + 255);    // 287
++
++function automatic logic [9:0] init_rom(input logic [5:0] a);
++    case (a)
++    6'd0 : init_rom = {OP_CMD, 8'h01};           // SWRESET
++    6'd1 : init_rom = {OP_DLY, 8'd120};          //   120 ms
++    6'd2 : init_rom = {OP_CMD, 8'h11};           // SLPOUT
++    6'd3 : init_rom = {OP_DLY, 8'd120};          //   120 ms (ILI9341 は SLPOUT 後 120 ms 必要)
++    6'd4 : init_rom = {OP_CMD, 8'h3A};           // COLMOD
++    6'd5 : init_rom = {OP_DAT, 8'h55};           //   16 bit/pixel (RGB565)
++    6'd6 : init_rom = {OP_CMD, 8'h36};           // MADCTL
++    6'd7 : init_rom = {OP_DAT, MADCTL};          //   向き・BGR
++    6'd8 : init_rom = {OP_CMD, 8'h2A};           // CASET 0..319 (全面クリア用)
++    6'd9 : init_rom = {OP_DAT, 8'h00};
++    6'd10: init_rom = {OP_DAT, 8'h00};
++    6'd11: init_rom = {OP_DAT, 8'h01};
++    6'd12: init_rom = {OP_DAT, 8'h3F};
++    6'd13: init_rom = {OP_CMD, 8'h2B};           // PASET 0..239
++    6'd14: init_rom = {OP_DAT, 8'h00};
++    6'd15: init_rom = {OP_DAT, 8'h00};
++    6'd16: init_rom = {OP_DAT, 8'h00};
++    6'd17: init_rom = {OP_DAT, 8'hEF};
++    6'd18: init_rom = {OP_CMD, 8'h2C};           // RAMWR
++    6'd19: init_rom = {OP_SPC, SPC_CLEAR};       //   320x240 を黒で埋める
++    6'd20: init_rom = {OP_CMD, 8'h29};           // DISPON (クリア後に表示 ON)
++    6'd21: init_rom = {OP_CMD, 8'h2A};           // CASET X0..X1 (NES 画面の窓)
++    6'd22: init_rom = {OP_DAT, 7'd0, X0[8]};
++    6'd23: init_rom = {OP_DAT, X0[7:0]};
++    6'd24: init_rom = {OP_DAT, 7'd0, X1[8]};
++    6'd25: init_rom = {OP_DAT, X1[7:0]};
++    6'd26: init_rom = {OP_CMD, 8'h2B};           // PASET 0..239
++    6'd27: init_rom = {OP_DAT, 8'h00};
++    6'd28: init_rom = {OP_DAT, 8'h00};
++    6'd29: init_rom = {OP_DAT, 8'h00};
++    6'd30: init_rom = {OP_DAT, 8'hEF};
++    default: init_rom = {OP_SPC, SPC_END};
++    endcase
++endfunction
++
++// ---------------------------------------------------------------------------
++// 5. シーケンサ
++// ---------------------------------------------------------------------------
++typedef enum logic [3:0] {
++    S_RST_LOW,     // ハードリセット L
++    S_RST_WAIT,    // リセット解除後の待ち
++    S_ROM,         // 初期化 ROM 実行
++    S_DELAY,       // ms 単位の待ち
++    S_CLEAR,       // 全面クリア (153,600 バイト)
++    S_WAIT_VBL,    // VBlank 開始待ち
++    S_RAMWR,       // RAMWR コマンド送信
++    S_PRIME,       // 先頭ピクセルの先読み
++    S_PIX_HI,      // 上位バイト送信
++    S_PIX_LO       // 下位バイト送信
++} seq_state_t;
++
++seq_state_t   st, st_ret;
++logic [5:0]   rom_pc;
++logic [9:0]   rom_q;
++logic [31:0]  dly_cnt;
++logic [17:0]  clr_cnt;
++logic [15:0]  pix;        // 送信中のピクセル番号 0..61439
++logic [15:0]  cur_rgb;
++logic [1:0]   prime_cnt;
++logic         vbl_d;
++
++wire vbl_now  = (scanline == 9'd240);
++wire vbl_rise = vbl_now & ~vbl_d;
++
++assign rom_q    = init_rom(rom_pc);
++assign lcd_rd_n = 1'b1;
++
++always_ff @(posedge clk) begin
++    if (!resetn) begin
++        st          <= S_RST_LOW;
++        st_ret      <= S_RST_LOW;
++        lcd_rst_n   <= 1'b0;
++        lcd_cs_n    <= 1'b1;
++        dly_cnt     <= 32'(10 * MS_DIV);   // RST L = 10 ms (規格 >= 10 us)
++        rom_pc      <= '0;
++        clr_cnt     <= '0;
++        pix         <= '0;
++        fb_raddr    <= '0;
++        cur_rgb     <= '0;
++        prime_cnt   <= '0;
++        vbl_d       <= 1'b0;
++        init_done   <= 1'b0;
++        frame_start <= 1'b0;
++    end else begin
++        vbl_d       <= vbl_now;
++        frame_start <= 1'b0;
++
++        case (st)
++        S_RST_LOW:
++            if (dly_cnt == 0) begin
++                lcd_rst_n <= 1'b1;
++                dly_cnt   <= 32'(120 * MS_DIV);  // リセット解除後 120 ms
++                st        <= S_RST_WAIT;
++            end else dly_cnt <= dly_cnt - 1'b1;
++
++        S_RST_WAIT:
++            if (dly_cnt == 0) begin
++                lcd_cs_n <= 1'b0;                // 以後 CS は常に L
++                st       <= S_ROM;
++            end else dly_cnt <= dly_cnt - 1'b1;
++
++        S_ROM: begin
++                case (rom_q[9:8])
++                OP_CMD, OP_DAT:
++                    if (tx_ready) rom_pc <= rom_pc + 1'b1;   // 送信は下の always_comb
++                OP_DLY: begin
++                    dly_cnt <= 32'(rom_q[7:0]) * 32'(MS_DIV);
++                    rom_pc  <= rom_pc + 1'b1;
++                    st      <= S_DELAY;
++                end
++                OP_SPC:
++                    if (rom_q[7:0] == SPC_CLEAR) begin
++                        clr_cnt <= '0;
++                        rom_pc  <= rom_pc + 1'b1;
++                        st      <= S_CLEAR;
++                    end else begin
++                        init_done <= 1'b1;
++                        st        <= S_WAIT_VBL;
++                    end
++                endcase
++            end
++
++        S_DELAY:
++            if (dly_cnt == 0) st <= S_ROM;
++            else dly_cnt <= dly_cnt - 1'b1;
++
++        S_CLEAR:                                 // 320*240*2 = 153,600 バイトの 0x00
++            if (clr_cnt == 18'd153_600) st <= S_ROM;
++            else if (tx_ready) clr_cnt <= clr_cnt + 1'b1;
++
++        S_WAIT_VBL:
++            if (vbl_rise) begin
++                frame_start <= 1'b1;
++                st          <= S_RAMWR;
++            end
++
++        S_RAMWR:                                 // 窓の先頭から書き込み開始
++            if (tx_ready) begin
++                pix       <= '0;
++                fb_raddr  <= '0;
++                prime_cnt <= '0;
++                st        <= S_PRIME;
++            end
++
++        S_PRIME: begin                           // fb_raddr=0 -> fb_q 有効まで待つ
++            prime_cnt <= prime_cnt + 1'b1;
++            if (prime_cnt == 2'd2) begin
++                cur_rgb <= pal565(fb_q);
++                st      <= S_PIX_HI;
++            end
++        end
++
++        S_PIX_HI:
++            if (tx_ready) begin
++                fb_raddr <= pix + 1'b1;          // 次のピクセルを先読み
++                st       <= S_PIX_LO;
++            end
++
++        S_PIX_LO:
++            if (tx_ready) begin
++                cur_rgb  <= pal565(fb_q);        // 先読み結果 (fb_raddr 設定から 2 clk 後)
++                if (pix == 16'd61_439) st <= S_WAIT_VBL;
++                else begin
++                    pix <= pix + 1'b1;
++                    st  <= S_PIX_HI;
++                end
++            end
++
++        default: st <= S_RST_LOW;
++        endcase
++    end
++end
++
++// 送信要求 (組み合わせ)。tx_ready と同じエッジで受け付けられ、シーケンサも同時に進む
++always_comb begin
++    tx_start = 1'b0;
++    tx_rs_in = 1'b1;
++    tx_d_in  = 8'h00;
++    case (st)
++    S_ROM:
++        if (rom_q[9:8] == OP_CMD || rom_q[9:8] == OP_DAT) begin
++            tx_start = 1'b1;
++            tx_rs_in = (rom_q[9:8] == OP_DAT);
++            tx_d_in  = rom_q[7:0];
++        end
++    S_CLEAR:  tx_start = (clr_cnt != 18'd153_600);
++    S_RAMWR:  begin tx_start = 1'b1; tx_rs_in = 1'b0; tx_d_in = 8'h2C; end
++    S_PIX_HI: begin tx_start = 1'b1; tx_d_in = cur_rgb[15:8]; end
++    S_PIX_LO: begin tx_start = 1'b1; tx_d_in = cur_rgb[7:0];  end
++    default: ;
++    endcase
++end
++
++endmodule
+diff -ruN a/src/nestang_top.sv b/src/nestang_top.sv
+--- a/src/nestang_top.sv	2026-10-29 23:42:18.213212999 +0900
++++ b/src/nestang_top.sv	2026-10-29 23:42:18.220349142 +0900
+@@ -65,10 +65,7 @@
+     input ds_miso,
+     output ds_mosi,
+     output ds_cs,
+-    output ds_clk2,
+-    input ds_miso2,
+-    output ds_mosi2,
+-    output ds_cs2,
++    // 2P (ds_clk2/ds_miso2/ds_mosi2/ds_cs2) は LCD 制御に転用したため削除 [LCD]
+ `endif
+ 
+     // USB
+@@ -79,11 +76,13 @@
+ //     inout usbdp2,
+ // `endif
+ 
+-    // HDMI TX
+-    output       tmds_clk_n,
+-    output       tmds_clk_p,
+-    output [2:0] tmds_d_n,
+-    output [2:0] tmds_d_p
++    // HDMI TX -> ILI9341 8080 8bit LCD [LCD]
++    output       lcd_rst_n,
++    output       lcd_cs_n,
++    output       lcd_rs,
++    output       lcd_wr_n,
++    output [7:0] lcd_d
++    // lcd_rd_n は FPGA から出さない (LCD 側で 3.3 V に固定)
+ );
+ 
+ // Core settings
+@@ -358,7 +357,20 @@
+ wire [9:0]  overlay_y;
+ wire [15:0] overlay_color;      // BGR5
+ 
+-// HDMI output
++// HDMI output -> LCD に置き換え [LCD]
++assign overlay_x = 11'd0;   // nes2hdmi が駆動していた iosys(textdisp) の入力を固定
++assign overlay_y = 10'd0;
++wire lcd_init_done;
++
++nes2lcd u_lcd (
++    .clk(clk), .resetn(sys_resetn),
++    .color(color), .cycle(cycle), .scanline(scanline),
++    .lcd_rst_n(lcd_rst_n), .lcd_cs_n(lcd_cs_n), .lcd_rs(lcd_rs),
++    .lcd_wr_n(lcd_wr_n), .lcd_rd_n(), .lcd_d(lcd_d),
++    .init_done(lcd_init_done), .frame_start()
++);
++
++/*
+ nes2hdmi u_hdmi (     // purple: RGB=440064 (010001000_00000000_01100100), BGR5=01100_00000_01000
+     .clk(clk), .resetn(sys_resetn),
+     .color(color), .cycle(cycle), 
+@@ -369,6 +381,7 @@
+     .tmds_clk_n(tmds_clk_n), .tmds_clk_p(tmds_clk_p),
+     .tmds_d_n(tmds_d_n), .tmds_d_p(tmds_d_p)
+ );
++*/
+ 
+ // IOSys for menu, rom loading...
+ localparam RV_IDLE_REQ0 = 3'd0;
+@@ -494,10 +507,8 @@
+     .clk(clk), .snes_buttons(joy1_btns),
+     .ds_clk(ds_clk), .ds_miso(ds_miso), .ds_mosi(ds_mosi), .ds_cs(ds_cs) 
+ );
+-controller_ds2 joy2_ds2 (
+-   .clk(clk), .snes_buttons(joy2_btns),
+-   .ds_clk(ds_clk2), .ds_miso(ds_miso2), .ds_mosi(ds_mosi2), .ds_cs(ds_cs2) 
+-);
++// 2P は削除 [LCD]。wor にドライバが無いと不定になるので 0 (未押下) に固定
++assign joy2_btns = 12'd0;
+ `endif
+ 
+ // Autofire for NES A (right) and B (left) buttons
+@@ -554,7 +565,8 @@
+ 
+ //assign led = ~{~UART_RXD, loader_done};
+ //assign led = ~{~UART_RXD, usb_conerr, loader_done};
+-assign led = {joy1_btns[1], joy1_btns[0]};
++// [LCD] READY(led[1]) = LCD 初期化完了, DONE(led[0]) = パッド 3 (NES A)
++assign led = {lcd_init_done, joy1_btns[0]};
+ 
+ reg [23:0] led_cnt;
+ always @(posedge clk) led_cnt <= led_cnt + 1;
+diff -ruN a/src/primer25k/nestang.cst b/src/primer25k/nestang.cst
+--- a/src/primer25k/nestang.cst	2026-10-29 23:42:18.215348835 +0900
++++ b/src/primer25k/nestang.cst	2026-10-29 23:42:18.222323530 +0900
+@@ -16,22 +16,6 @@
+ //IO_PORT "tmds_d_p[1]" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+ //IO_LOC "tmds_d_p[2]" F5,G5;
+ //IO_PORT "tmds_d_p[2]" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+-IO_LOC "tmds_clk_p" H5;
+-IO_PORT "tmds_clk_p" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_clk_n" J5;
+-IO_PORT "tmds_clk_n" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_p[0]" H8;
+-IO_PORT "tmds_d_p[0]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_n[0]" H7;
+-IO_PORT "tmds_d_n[0]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_p[1]" G7;
+-IO_PORT "tmds_d_p[1]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_n[1]" G8;
+-IO_PORT "tmds_d_n[1]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_p[2]" F5;
+-IO_PORT "tmds_d_p[2]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+-IO_LOC "tmds_d_n[2]" G5;
+-IO_PORT "tmds_d_n[2]" PULL_MODE=NONE IO_TYPE=LVCMOS33D;
+ 
+ // SDCard
+ // sipeed pmod tfcardv2
+@@ -203,13 +187,34 @@
+ IO_LOC "ds_cs"  A11;
+ IO_PORT "ds_cs" PULL_MODE=NONE IO_TYPE=LVCMOS33;
+ 
+-// Joystick 2 on pmod
+-IO_LOC "ds_clk2" K5;
+-IO_PORT "ds_clk2" PULL_MODE=NONE IO_TYPE=LVCMOS33;
+-IO_LOC "ds_miso2" L11;
+-IO_PORT "ds_miso2" PULL_MODE=UP IO_TYPE=LVCMOS33;
+-IO_LOC "ds_mosi2" E10;
+-IO_PORT "ds_mosi2" PULL_MODE=NONE IO_TYPE=LVCMOS33;
+-IO_LOC "ds_cs2"  A10;
+-IO_PORT "ds_cs2" PULL_MODE=NONE IO_TYPE=LVCMOS33;
++// Joystick 2 on pmod -> LCD 制御に転用 [LCD]
+ 
++
++//------------------------------------------------------------------------------------
++// [LCD] ILI9341 8080 8bit (2.4" UNO shield)
++// データ: J6 (旧 HDMI/DVI PMOD)
++IO_LOC "lcd_d[0]" H5;
++IO_PORT "lcd_d[0]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[1]" J5;
++IO_PORT "lcd_d[1]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[2]" H8;
++IO_PORT "lcd_d[2]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[3]" H7;
++IO_PORT "lcd_d[3]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[4]" G7;
++IO_PORT "lcd_d[4]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[5]" G8;
++IO_PORT "lcd_d[5]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[6]" F5;
++IO_PORT "lcd_d[6]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_d[7]" G5;
++IO_PORT "lcd_d[7]" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++// 制御: J5 偶数列 (旧 DS2 2P)
++IO_LOC "lcd_cs_n" K5;
++IO_PORT "lcd_cs_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_rs" L11;
++IO_PORT "lcd_rs" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_wr_n" E10;
++IO_PORT "lcd_wr_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
++IO_LOC "lcd_rst_n" A10;
++IO_PORT "lcd_rst_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+diff -ruN a/src/primer25k/nestang.sdc b/src/primer25k/nestang.sdc
+--- a/src/primer25k/nestang.sdc	2026-10-29 23:42:18.217685728 +0900
++++ b/src/primer25k/nestang.sdc	2026-10-29 23:42:18.222350714 +0900
+@@ -4,7 +4,8 @@
+ create_generated_clock -name clk -source [get_nets {fclk}] -divide_by 3 [get_nets {clk}] // 21.4912 Mhz
+ 
+ // HDMI clocks
+-create_clock -name hclk5 -period 2.6936 [get_nets {hclk5}]       // 371.25 Mhz
++// [LCD] HDMI を外すと hclk5 が合成で削除され ERROR TA2003 になるため無効化
++// create_clock -name hclk5 -period 2.6936 [get_nets {hclk5}]       // 371.25 Mhz
+ 
+ // NES/iosys to SDRAM, 3 fclk cycles
+ set_multicycle_path 3 -end -setup -from [get_clocks {clk}] -to [get_clocks {fclk}]
